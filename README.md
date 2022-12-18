@@ -1,13 +1,16 @@
 # What
-- Template use for setup setting you need for create unity package
-- Replace your setting in file package.json
+Let’s first acknowledge that rope is used pretty sparingly in video games, with good reason:
+- It’s computationally expensive to simulate.
+- It’s cognitively expensive to develop.
+- Using physically-based rope for anything remotely interesting is full of edge cases and other hurdles.
+- It can be a pain to render.
 
 
 # How To Install Package
 
 Add the lines below to `Packages/manifest.json`
 
-for version x.x.x
+for version 1.0.0
 ```csharp
-"com.pancake.__package_name__": "https://github.com/pancake-llc/packagename.git#x.x.x",
+"com.pancake.rope": "https://github.com/pancake-llc/rope.git#1.0.0",
 ```

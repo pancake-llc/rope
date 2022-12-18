@@ -1,7 +1,7 @@
 {
-  "name": "com.pancake.__package_name__",
-  "displayName": "__Package_Name__",
-  "description": "__Package_Description__",
+  "name": "com.pancake.rope",
+  "displayName": "Rope",
+  "description": "Lightwight rope 2D and 3D for Unity, simple way to hanging objects",
   "version": "1.0.0",
   "unity": "2021.3",
   "category": "pancake",
@@ -16,8 +16,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git@github.com:pancake-llc/__name_repo_contain_package__.git",
-    "directory": "__Package_Display_Name__"
+    "url": "git@github.com:pancake-llc/rope.git",
+    "directory": "Rope"
   },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com/@pancake-llc"
