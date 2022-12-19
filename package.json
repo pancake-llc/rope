@@ -13,6 +13,7 @@
   "license": "MIT",
   "keywords": [ "unity" ],
   "dependencies": {
+    "com.unity.burst": "1.6.6"
   },
   "repository": {
     "type": "git",
@@ -21,12 +22,5 @@
   },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com/@pancake-llc"
-  }/*,
-  "samples": [
-  {
-    "displayName": "__Sample Name__",
-    "description": "__Sample_Description__",
-    "path": "Samples~/__Name_Folder_Sample__"
   }
-]*/
 }

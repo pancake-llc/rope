@@ -1,10 +1,17 @@
+using System;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Profiling;
 
 namespace Pancake.Rope
 {
+    [RequireComponent(typeof(MeshRenderer))]
+    [RequireComponent(typeof(MeshFilter))]
     public class Rope : MonoBehaviour
     {
+        // These are constants because they require a restart to change.
         // Maximum number of colliders hitting the rope at once.
         private const int MAX_ROPE_COLLISIONS = 32;
 
@@ -30,18 +37,30 @@ namespace Pancake.Rope
 
         public float drawWidth = 0.025f;
         public Vector2 gravity = new Vector2(0, -20f);
+        public float maxSimMove = 1f;
         public float collisionRadius = 0.5f; // Collision radius around each node.  Set high to avoid tunneling.
+        public float friction = 0.5f;
 
-        private VerletNode[] nodes;
+        public LayerMask layerCollision;
+
+        // Job arrays and stuffs.
+        private NativeArray<VerletNode> nodes;
+        private NativeArray<Constraint> constraints;
+
+        private NativeArray<CollisionInfo> collisionInfos;
+
+        //private NativeArray<float> timeAccumulator;
+        private NativeArray<int> collidingNodes;
+        private Job job;
+        private JobHandle jobHandle;
+
         private float timeAccum;
-        private CollisionInfo[] collisionInfos;
+
         private int numCollisions;
         private bool shouldSnapshotCollision;
 
-        private Camera cam;
         private Material material;
         private Collider2D[] colliderBuffer;
-
         private Vector4[] renderPositions;
 
         private void Awake()
@@ -51,20 +70,21 @@ namespace Pancake.Rope
                 Debug.LogError("Total nodes is more than MAX_RENDER_POINTS, so won't be able to render the entire rope.");
             }
 
-            nodes = new VerletNode[totalNodes];
-            collisionInfos = new CollisionInfo[MAX_ROPE_COLLISIONS];
-            for (int i = 0; i < collisionInfos.Length; i++)
-            {
-                collisionInfos[i] = new CollisionInfo(totalNodes);
-            }
-
             // Buffer for OverlapCircleNonAlloc.
             colliderBuffer = new Collider2D[COLLIDER_BUFFER_SIZE];
+
+            // Jobs setup.
+            // You could use `NativeList` for some of these instead, and not worry about all the constants.
+            nodes = new NativeArray<VerletNode>(totalNodes, Allocator.Persistent);
+            constraints = new NativeArray<Constraint>(totalNodes, Allocator.Persistent);
+            collisionInfos = new NativeArray<CollisionInfo>(MAX_ROPE_COLLISIONS, Allocator.Persistent);
+            collidingNodes = new NativeArray<int>(totalNodes * MAX_ROPE_COLLISIONS, Allocator.Persistent);
+
             renderPositions = new Vector4[totalNodes];
 
             // Spawn nodes starting from the transform position and working down.
             Vector2 pos = transform.position;
-            for (int i = 0; i < totalNodes; i++)
+            for (int i = 0; i < nodes.Length; i++)
             {
                 nodes[i] = new VerletNode(pos);
                 renderPositions[i] = new Vector4(pos.x, pos.y, 1, 1);
@@ -114,53 +134,85 @@ namespace Pancake.Rope
 
         private void Update()
         {
-            if (shouldSnapshotCollision)
-            {
-                SnapshotCollision();
-            }
+            if (shouldSnapshotCollision) SnapshotCollision();
 
-            // Fixed timestep.
+            // Fixed timestep.  We calculate ahead of time to avoid transporting data to the job.
             timeAccum += Time.deltaTime;
             timeAccum = Mathf.Min(timeAccum, maxStep);
-            while (timeAccum >= stepTime)
+            int executions = (int) (timeAccum / stepTime);
+            timeAccum = timeAccum % stepTime;
+
+            job = new Job
             {
-                Simulate();
+                executions = executions,
+                iterations = iterations,
+                nodeDistance = nodeDistance,
+                gravity = gravity,
+                maxSimMove = maxSimMove,
+                friction = friction,
+                constraints = constraints,
+                collisionInfos = collisionInfos,
+                numCollisions = numCollisions,
+                collidingNodes = collidingNodes,
+                nodes = new NativeArray<VerletNode>(nodes, Allocator.TempJob),
+                stepTime = stepTime,
+            };
 
-                for (int i = 0; i < iterations; i++)
-                {
-                    ApplyConstraints();
-                    AdjustCollisions();
-                }
-
-                timeAccum -= stepTime;
-            }
+            jobHandle = job.Schedule();
         }
 
         private void LateUpdate()
         {
+            // Wait for Job to complete.  Hopefully it's done or almost done by now.
+            jobHandle.Complete();
+
+            // At this point, we could implement some interpolation by have 2 separate node buffers, one for the previous
+            // step and one for the latest one, and then one interpolate between them depending on frame time.
+            job.nodes.CopyTo(nodes);
+            job.nodes.Dispose();
+
+            // Send positions to the GPU for rendering this frame.
+            // Maybe we could do this in the job, but performance should be fine.
             for (int i = 0; i < nodes.Length; i++)
             {
+                // w of 1 == we should render this node.
                 renderPositions[i].w = 1;
+
                 Vector2 pos = nodes[i].position;
                 renderPositions[i].x = pos.x;
                 renderPositions[i].y = pos.y;
+                // z indicates how stretched this node is, with <1 being stretched, 1 being normal, and >1 having slack. 
+                // See: https://gist.github.com/Toqozz/52fc00f22ae02bba7c48f2062d19bec9 for example implementation.
                 renderPositions[i].z = 1;
             }
 
             material.SetVectorArray("_Points", renderPositions);
+
+            // We need to manually update transform position or we might get culled after traveling a long distance.
+            transform.position = (Vector2) nodes[0].position;
+            if (Input.GetMouseButton(0))
+            {
+                SetConstraint(0, Camera.main.ScreenToWorldPoint(Input.mousePosition));
+            }
+            else if (Input.GetMouseButton(1))
+            {
+                UnsetConstraint(0);
+            }
         }
 
         private void FixedUpdate() { shouldSnapshotCollision = true; }
 
         private void SnapshotCollision()
         {
-            Profiler.BeginSample("Snapshot");
+            Profiler.BeginSample("Collision Snapshot");
 
+            // Update the colliders in range of each node.
             numCollisions = 0;
-            // Loop through each node and get collisions within a radius.
             for (int i = 0; i < nodes.Length; i++)
             {
-                int collisions = Physics2D.OverlapCircleNonAlloc(nodes[i].position, collisionRadius, colliderBuffer);
+                // `OverlapCircle` has a `LayerMask` argument you can use to only detect collisions on a certain layer.
+                // This is good if you want to separate rope collision from player collision.
+                int collisions = Physics2D.OverlapCircleNonAlloc(nodes[i].position, collisionRadius, colliderBuffer, layerCollision);
 
                 for (int j = 0; j < collisions; j++)
                 {
@@ -168,6 +220,8 @@ namespace Pancake.Rope
                     int id = col.GetInstanceID();
 
                     int idx = -1;
+                    // We only check up to `numCollisions`, which is reset at the start of this function, so we only get
+                    // fresh data here.
                     for (int k = 0; k < numCollisions; k++)
                     {
                         if (collisionInfos[k].id == id)
@@ -177,19 +231,31 @@ namespace Pancake.Rope
                         }
                     }
 
-                    // If we didn't have the collider, we need to add it.
+                    // If we couldn't find the collider in the array, then it's new, and we need to set stuff up.
                     if (idx < 0)
                     {
-                        // Record all the data we need to use into our classes.
                         CollisionInfo ci = collisionInfos[numCollisions];
                         ci.id = id;
                         ci.wtl = col.transform.worldToLocalMatrix;
                         ci.ltw = col.transform.localToWorldMatrix;
-                        ci.scale.x = ci.ltw.GetColumn(0).magnitude;
-                        ci.scale.y = ci.ltw.GetColumn(1).magnitude;
-                        ci.position = col.transform.position;
+                        ci.scale.x = math.length(ci.ltw.c0.xyz);
+                        ci.scale.y = math.length(ci.ltw.c1.xyz);
+                        ci.position = (Vector2) col.transform.position;
                         ci.numCollisions = 1; // 1 collision, this one.
-                        ci.collidingNodes[0] = i;
+                        /*
+                        // Workaround for tiled and sliced sprite colliders.
+                        // See blog for a slightly more optimal implementation of this.
+                        var sr = col.GetComponent<SpriteRenderer>();
+                        if (sr && sr.drawMode != SpriteDrawMode.Simple) {
+                            Vector2 size = col.GetComponent<SpriteRenderer>().size;
+                            ci.scale.x *= size.x;
+                            ci.scale.y *= size.y;
+                            ci.ltw = float4x4.TRS(col.transform.position, col.transform.rotation,
+                                math.float3(ci.scale.x, ci.scale.y, 1f));
+                            ci.wtl = math.inverse(ci.ltw);
+                        }
+                        */
+                        collidingNodes[totalNodes * numCollisions] = i;
 
                         switch (col)
                         {
@@ -206,24 +272,27 @@ namespace Pancake.Rope
                                 break;
                         }
 
+                        collisionInfos[numCollisions] = ci;
+
+                        // Increment and check to make sure we don't exceed max colliders.
                         numCollisions++;
                         if (numCollisions >= MAX_ROPE_COLLISIONS)
                         {
                             Profiler.EndSample();
                             return;
                         }
-
-                        // If we found the collider, then we just have to increment the collisions and add our node.
                     }
                     else
                     {
-                        CollisionInfo ci = collisionInfos[idx];
-                        if (ci.numCollisions >= totalNodes)
+                        CollisionInfo nc = collisionInfos[idx];
+                        // This collider has reached the maximum number of nodes.
+                        if (nc.numCollisions >= totalNodes)
                         {
                             continue;
                         }
 
-                        ci.collidingNodes[ci.numCollisions++] = i;
+                        collidingNodes[idx * totalNodes + nc.numCollisions++] = i;
+                        collisionInfos[idx] = nc;
                     }
                 }
             }
@@ -233,143 +302,43 @@ namespace Pancake.Rope
             Profiler.EndSample();
         }
 
-        private void Simulate()
+        private void OnDrawGizmos()
         {
             for (int i = 0; i < nodes.Length; i++)
-            {
-                VerletNode node = nodes[i];
-
-                Vector2 temp = node.position;
-                node.position += (node.position - node.oldPosition) + gravity * stepTime * stepTime;
-                node.oldPosition = temp;
-            }
+                Gizmos.DrawWireSphere(new Vector3(nodes[i].position.x, nodes[i].position.y), collisionRadius);
         }
 
-        private void ApplyConstraints()
+        private void OnDestroy()
         {
-            Profiler.BeginSample("Constraints");
-
-            for (int i = 0; i < nodes.Length - 1; i++)
-            {
-                VerletNode node1 = nodes[i];
-                VerletNode node2 = nodes[i + 1];
-
-                // First node follows the mouse, for debugging.
-                if (i == 0 && Input.GetMouseButton(0))
-                {
-                    node1.position = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-                }
-
-                // Current distance between rope nodes.
-                float diffX = node1.position.x - node2.position.x;
-                float diffY = node1.position.y - node2.position.y;
-                float dist = Vector2.Distance(node1.position, node2.position);
-                float difference = 0;
-                // Guard against divide by 0.
-                if (dist > 0)
-                {
-                    difference = (nodeDistance - dist) / dist;
-                }
-
-                Vector2 translate = new Vector2(diffX, diffY) * (.5f * difference);
-
-                node1.position += translate;
-                node2.position -= translate;
-            }
-
-            /*
-            // Distance constraint which reduces iterations, but doesn't handle stretchyness in a natural way.
-            VerletNode first = nodes[0];
-            VerletNode last = nodes[nodes.Length-1];
-            // Same distance calculation as above, but less optimal.
-            float distance = Vector2.Distance(first.position, last.position);
-            if (distance > 0 && distance > nodes.Length * nodeDistance) {
-                Vector2 dir = (last.position - first.position).normalized;
-                last.position = first.position + nodes.Length * nodeDistance * dir;
-            }
-            */
-
-            Profiler.EndSample();
+            // Clean up all our buffers.
+            // This method also executes when stopping play mode.
+            nodes.Dispose();
+            constraints.Dispose();
+            collisionInfos.Dispose();
+            collidingNodes.Dispose();
         }
 
-        private void AdjustCollisions()
+
+        // ---------------------------------
+        // API to change node properties. 
+        // These methods must be called in `LateUpdate()`, or the script calling them must be scheduled to run before
+        // this script.
+        // ---------------------------------
+
+
+        public void SetConstraint(int index, Vector2 position)
         {
-            Profiler.BeginSample("Collision");
+            Constraint c = constraints[index];
+            c.enabled = true;
+            c.position = position;
+            constraints[index] = c;
+        }
 
-            for (int i = 0; i < numCollisions; i++)
-            {
-                CollisionInfo ci = collisionInfos[i];
-
-                switch (ci.colliderType)
-                {
-                    case EColliderType.Circle:
-                    {
-                        float radius = ci.colliderSize.x * Mathf.Max(ci.scale.x, ci.scale.y);
-
-                        for (int j = 0; j < ci.numCollisions; j++)
-                        {
-                            VerletNode node = nodes[ci.collidingNodes[j]];
-                            float distance = Vector2.Distance(ci.position, node.position);
-
-                            // Early out if we're not colliding.
-                            if (distance - radius > 0)
-                            {
-                                continue;
-                            }
-
-                            Vector2 dir = (node.position - ci.position).normalized;
-                            Vector2 hitPos = ci.position + dir * radius;
-                            node.position = hitPos;
-                        }
-                    }
-                        break;
-
-                    case EColliderType.Box:
-                    {
-                        for (int j = 0; j < ci.numCollisions; j++)
-                        {
-                            VerletNode node = nodes[ci.collidingNodes[j]];
-                            Vector2 localPoint = ci.wtl.MultiplyPoint(node.position);
-
-                            // If distance from center is more than box "radius", then we can't be colliding.
-                            Vector2 half = ci.colliderSize * .5f;
-                            Vector2 scalar = ci.scale;
-                            float dx = localPoint.x;
-                            float px = half.x - Mathf.Abs(dx);
-                            if (px <= 0)
-                            {
-                                continue;
-                            }
-
-                            float dy = localPoint.y;
-                            float py = half.y - Mathf.Abs(dy);
-                            if (py <= 0)
-                            {
-                                continue;
-                            }
-
-                            // Need to multiply distance by scale or we'll mess up on scaled box corners.
-                            if (px * scalar.x < py * scalar.y)
-                            {
-                                float sx = Mathf.Sign(dx);
-                                localPoint.x = half.x * sx;
-                            }
-                            else
-                            {
-                                float sy = Mathf.Sign(dy);
-                                localPoint.y = half.y * sy;
-                            }
-
-                            Vector2 hitPos = ci.ltw.MultiplyPoint(localPoint);
-                            node.position = hitPos;
-                        }
-                    }
-                        break;
-                }
-            }
-
-
-            Profiler.EndSample();
+        public void UnsetConstraint(int index)
+        {
+            Constraint c = constraints[index];
+            c.enabled = false;
+            constraints[index] = c;
         }
     }
 }
